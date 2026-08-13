@@ -3,8 +3,10 @@ package com.netbridge.ai.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -70,12 +72,17 @@ class NetBridgeService : Service() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("NetBridge Proxy Active")
             .setContentText("Routing via VPN...")
-            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setSmallIcon(android.R.drawable.sym_def_app_icon)
             .setContentIntent(pendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
             .build()
 
-        startForeground(1, notification)
+        // Explicitly tell Android 14 this is a Data Sync service to prevent crashes
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, notification)
+        }
     }
 
     private fun updateNotification() {
@@ -97,7 +104,9 @@ class NetBridgeService : Service() {
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
         }
     
-        nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+        try {
+            nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+        } catch (e: Exception) { }
     }
 
     private fun acquireWakeLock() {
@@ -108,16 +117,18 @@ class NetBridgeService : Service() {
 
     private fun updateNetworkInterfaces() {
         val ips = mutableListOf<String>()
-        NetworkInterface.getNetworkInterfaces().iterator().forEach { intf ->
-            // Filter out loopback, and pick active interfaces (Hotspot, USB Tethering, Wi-Fi)
-            if (!intf.isLoopback && intf.isUp && (intf.name.contains("wlan") || intf.name.contains("rndis") || intf.name.contains("swlan"))) {
-                intf.inetAddresses.iterator().forEach { addr ->
-                    if (!addr.isLoopbackAddress && addr.address.size == 4) { // IPv4
-                        ips.add("${intf.name}: ${addr.hostAddress}")
+        try {
+            NetworkInterface.getNetworkInterfaces().iterator().forEach { intf ->
+                // Filter out loopback, and pick active interfaces (Hotspot, USB Tethering, Wi-Fi)
+                if (!intf.isLoopback && intf.isUp && (intf.name.contains("wlan") || intf.name.contains("rndis") || intf.name.contains("swlan"))) {
+                    intf.inetAddresses.iterator().forEach { addr ->
+                        if (!addr.isLoopbackAddress && addr.address.size == 4) { // IPv4
+                            ips.add("${intf.name}: ${addr.hostAddress}")
+                        }
                     }
                 }
             }
-        }
+        } catch (e: Exception) { }
         NetBridgeState.activeInterfaces.value = ips
     }
 
@@ -126,7 +137,7 @@ class NetBridgeService : Service() {
         proxyEngine?.stop()
         wakeLock?.let { if (it.isHeld) it.release() }
     
-        // مشکل کرش اینجا حل می‌شود:
+        // مشکل کرش اینجا حل می‌شود: (Your fix is here!)
         registrationListener?.let { 
             try { nsdManager?.unregisterService(it) } catch (e: Exception) {}
         }
@@ -134,3 +145,6 @@ class NetBridgeService : Service() {
         NetBridgeState.isRunning.value = false
         super.onDestroy()
     }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}

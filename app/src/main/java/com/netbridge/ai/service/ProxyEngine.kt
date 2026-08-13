@@ -2,6 +2,8 @@ package com.netbridge.ai.service
 
 import com.netbridge.ai.state.NetBridgeState
 import kotlinx.coroutines.*
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -18,59 +20,86 @@ class ProxyEngine(private val port: Int) {
     fun start(scope: CoroutineScope) {
         isRunning = true
         serverSocket = ServerSocket(port)
-        
-        scope.launch(Dispatchers.IO) {
-            speedTracker()
-        }
+
+        scope.launch(Dispatchers.IO) { speedTracker() }
 
         scope.launch(Dispatchers.IO) {
             while (isRunning) {
                 try {
                     val clientSocket = serverSocket?.accept() ?: break
                     NetBridgeState.connectedClients.value++
-                    launch(Dispatchers.IO) { handleClient(clientSocket) }
+                    launch(Dispatchers.IO) { handleSocks5Client(clientSocket) }
                 } catch (e: Exception) { break }
             }
         }
     }
 
-    private suspend fun handleClient(clientSocket: Socket) {
+    private suspend fun handleSocks5Client(clientSocket: Socket) {
         withContext(Dispatchers.IO) {
+            var targetSocket: Socket? = null
             try {
-                val input = clientSocket.getInputStream()
-                val output = clientSocket.getOutputStream()
-                
-                // Read HTTP Request line
-                val requestLine = readLine(input) ?: return@withContext
-                val parts = requestLine.split(" ")
-                if (parts.size < 3) return@withContext
-                
-                val method = parts[0]
-                val url = parts[1]
+                val input = DataInputStream(clientSocket.getInputStream())
+                val output = DataOutputStream(clientSocket.getOutputStream())
 
-                val hostPort = extractHostPort(url)
-                val targetSocket = Socket(hostPort.first, hostPort.second)
+                // 1. SOCKS5 Handshake
+                val version = input.readByte().toInt()
+                if (version != 5) return@withContext
+                val numMethods = input.readByte().toInt()
+                val methods = ByteArray(numMethods)
+                input.readFully(methods)
 
-                if (method.uppercase() == "CONNECT") {
-                    // HTTPS Tunneling Handshake
-                    output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
-                    output.flush()
-                } else {
-                    // Forward standard HTTP Request
-                    val targetOut = targetSocket.getOutputStream()
-                    targetOut.write("$requestLine\r\n".toByteArray())
-                    // Normally you'd forward headers here, highly simplified for this demo
+                // Reply: No Authentication required
+                output.write(byteArrayOf(0x05, 0x00))
+                output.flush()
+
+                // 2. Connection Request
+                if (input.readByte().toInt() != 5) return@withContext
+                val command = input.readByte().toInt()
+                if (command != 1) return@withContext // Only CONNECT command is supported
+                input.readByte() // Reserved
+                val addressType = input.readByte().toInt()
+
+                var targetAddress = ""
+                when (addressType) {
+                    1 -> { // IPv4
+                        val ipBytes = ByteArray(4)
+                        input.readFully(ipBytes)
+                        targetAddress = java.net.InetAddress.getByAddress(ipBytes).hostAddress ?: ""
+                    }
+                    3 -> { // Domain Name
+                        val length = input.readByte().toInt()
+                        val domainBytes = ByteArray(length)
+                        input.readFully(domainBytes)
+                        targetAddress = String(domainBytes)
+                    }
+                    else -> return@withContext // IPv6 is skipped for simplicity
                 }
 
-                // Setup Bidirectional Relay via Coroutines
+                val targetPort = input.readUnsignedShort()
+
+                // 3. Connect to Target
+                try {
+                    targetSocket = Socket(targetAddress, targetPort)
+                    // Success Reply
+                    output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+                    output.flush()
+                } catch (e: Exception) {
+                    // Failure Reply
+                    output.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+                    output.flush()
+                    return@withContext
+                }
+
+                // 4. Relay Traffic
                 val job1 = launch { relayStream(clientSocket.getInputStream(), targetSocket.getOutputStream(), txBytes) }
                 val job2 = launch { relayStream(targetSocket.getInputStream(), clientSocket.getOutputStream(), rxBytes) }
-                
+
                 joinAll(job1, job2)
             } catch (e: Exception) {
-                // Connection closed or error
+                // Connection closed
             } finally {
-                clientSocket.close()
+                try { clientSocket.close() } catch (e: Exception) {}
+                try { targetSocket?.close() } catch (e: Exception) {}
                 NetBridgeState.connectedClients.value--
             }
         }
@@ -78,7 +107,7 @@ class ProxyEngine(private val port: Int) {
 
     private suspend fun relayStream(input: InputStream, output: OutputStream, counter: AtomicLong) {
         withContext(Dispatchers.IO) {
-            val buffer = ByteArray(8192)
+            val buffer = ByteArray(16384) // 16KB buffer for max speed
             var read: Int
             try {
                 while (input.read(buffer).also { read = it } != -1) {
@@ -97,35 +126,17 @@ class ProxyEngine(private val port: Int) {
             delay(1000)
             val currentRx = rxBytes.get()
             val currentTx = txBytes.get()
-            
+
             NetBridgeState.downloadSpeedKbps.value = (currentRx - lastRx) / 1024
             NetBridgeState.uploadSpeedKbps.value = (currentTx - lastTx) / 1024
-            
+
             lastRx = currentRx
             lastTx = currentTx
         }
     }
 
-    private fun readLine(input: InputStream): String? {
-        val sb = StringBuilder()
-        var c: Int
-        while (input.read().also { c = it } != -1) {
-            if (c == '\n'.code) break
-            if (c != '\r'.code) sb.append(c.toChar())
-        }
-        return if (sb.isEmpty()) null else sb.toString()
-    }
-
-    private fun extractHostPort(url: String): Pair<String, Int> {
-        val cleanUrl = url.replace("http://", "").replace("https://", "")
-        val hostParts = cleanUrl.split("/")[0].split(":")
-        val host = hostParts[0]
-        val port = if (hostParts.size > 1) hostParts[1].toInt() else 80
-        return Pair(host, port)
-    }
-
     fun stop() {
         isRunning = false
-        serverSocket?.close()
+        try { serverSocket?.close() } catch (e: Exception) {}
     }
 }

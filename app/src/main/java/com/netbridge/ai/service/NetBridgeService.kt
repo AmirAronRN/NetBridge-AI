@@ -21,7 +21,8 @@ class NetBridgeService : Service() {
     private var proxyEngine: ProxyEngine? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var nsdManager: NsdManager? = null
-
+    private var registrationListener: NsdManager.RegistrationListener? = null
+    
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
             stopSelf()
@@ -88,13 +89,15 @@ class NetBridgeService : Service() {
             serviceType = "_netbridge._tcp"
             setPort(port)
         }
-        
-        nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, object : NsdManager.RegistrationListener {
+    
+        registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(NsdServiceInfo: NsdServiceInfo) {}
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
             override fun onServiceUnregistered(arg0: NsdServiceInfo) {}
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
-        })
+        }
+    
+        nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
     }
 
     private fun acquireWakeLock() {
@@ -122,10 +125,12 @@ class NetBridgeService : Service() {
         job.cancel()
         proxyEngine?.stop()
         wakeLock?.let { if (it.isHeld) it.release() }
-        nsdManager?.unregisterService(null) // omitted listener implementation for brevity
+    
+        // مشکل کرش اینجا حل می‌شود:
+        registrationListener?.let { 
+            try { nsdManager?.unregisterService(it) } catch (e: Exception) {}
+        }
+    
         NetBridgeState.isRunning.value = false
         super.onDestroy()
     }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-}
